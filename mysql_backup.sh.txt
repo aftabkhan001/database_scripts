@@ -1,0 +1,74 @@
+#!/bin/bash
+PATH=$PATH:/usr/bin/
+host=`hostname | sed 's/-/_/g'`
+now=`date +"%m_%d_%Y__%H_%M_%S"`
+dbpass=********
+dbuser=user_name
+authorized_key=/home/monyog/.ssh/dbbackup
+backup_file=/data/backup/mysqldump_$now.sql
+backup_path=/data/backup
+storage_host_path=logftp@10.7.6.250:/data/Save/DB_ITPROD/$host/
+
+# Parameters
+backup_type=$1
+cluster=$2
+
+if [ "$#" -le 0 ]; then
+    echo "illegal number of arguments, please enter xtrabackup or mysqldump"
+    exit
+fi
+
+
+/usr/bin/mysql -u$dbuser -p$dbpass -e"insert into dbtools.backup_status values (null, 'Backup job started', NOW());"
+
+# Donor/Desynced ON
+
+# switch galera cluster to desync/donor to allow backups withou stalls
+# https://www.percona.com/blog/2013/10/08/taking-backups-percona-xtradb-cluster-without-stalls-flow-control/
+
+if [ "$cluster" == "galera" ]
+then
+/usr/bin/mysql -u$dbuser -p$dbpass -e"SET GLOBAL wsrep_desync = ON;"
+fi
+
+# Start xtrabackup
+if [ "$backup_type" == "xtrabackup" ]; then
+backup_file=$backup_path/xtrabackup_$now.tar.gz
+/usr/bin/innobackupex --user=$dbuser --password=$dbpass --slave-info --stream=tar ./  2> /tmp/xtrabackup.stderr | /bin/gzip -> $backup_file
+backup_status=`tail -n1 /tmp/xtrabackup.stderr`
+else # Launch mysqldump
+/usr/bin/mysqldump -u$dbuser -p$dbpass --single-transaction --all-databases --dump-slave --routines  > $backup_file
+backup_status=`tail -n1 $backup_file`
+/bin/gzip --force $backup_file
+fi
+
+# Donor/Desynced OFF
+
+if [ "$cluster" == "galera" ]
+then
+/usr/bin/mysql -u$dbuser -p$dbpass -e"SET GLOBAL wsrep_desync = OFF;"
+
+fi
+
+
+if [[ $backup_status == *Error* ]] && [[ "$backup_type" == "xtrabackup" ]];
+then
+mysql -u$dbuser -p$dbpass -e"insert into dbtools.backup_status values (null, 'Backup job failed', NOW());"
+exit
+fi
+
+if [[ ! $backup_status == *"Dump completed"* ]] && [[ "$backup_type" == "mysqldump"  ]];
+then
+mysql -u$dbuser -p$dbpass -e"insert into dbtools.backup_status values (null, 'Backup job failed', NOW());"
+echo here
+exit
+fi
+
+
+# Copy backup file to remote storage server
+
+ /usr/bin/mysql -u$dbuser -p$dbpass -e"insert into dbtools.backup_status values (null, '$backup_status', NOW());"  &&  /usr/bin/scp -Cq -o StrictHostKeyChecking=no -i $authorized_key $backup_file* $storage_host_path && /usr/bin/mysql -u$dbuser -p$dbpass -e"insert into dbtools.backup_status values (null, 'Backup file has been copied to remote storage', NOW());" || /usr/bin/mysql -u$dbuser -p$dbpass -e"insert into dbtools.backup_status values (null, 'failed to copy backup file', NOW());"
+
+# Cleanup
+
+/usr/bin/find $backup_path/*.gz -mtime +2 -delete
